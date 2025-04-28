@@ -21,6 +21,7 @@
 #include <cassert>
 #include <cstddef>
 #include <limits>
+#include <algorithm>
 
 #include "bitboard.h"
 #include "misc.h"
@@ -56,19 +57,26 @@ enum Stages {
     QCAPTURE
 };
 
-// Sort moves in descending order up to and including a given limit.
-// The order of moves smaller than the limit is left unspecified.
-void partial_insertion_sort(ExtMove* begin, ExtMove* end, int limit) {
+inline void partial_insertion_sort(ExtMove* begin, ExtMove* end, int limit) {
+  ExtMove* mid = std::partition(begin, end,
+                       [&](ExtMove &m){ return m.value >= limit; });
+  int n = int(mid - begin);
+  if (n <= 1) return;
 
-    for (ExtMove *sortedEnd = begin, *p = begin + 1; p < end; ++p)
-        if (p->value >= limit)
-        {
-            ExtMove tmp = *p, *q;
-            *p          = *++sortedEnd;
-            for (q = sortedEnd; q != begin && *(q - 1) < tmp; --q)
-                *q = *(q - 1);
-            *q = tmp;
-        }
+  int K = std::min(2, n);              // try K=4 or tune this
+  std::nth_element(begin, begin + K, mid,
+                   [](ExtMove const &a, ExtMove const &b){ return b < a; });
+  // now [begin…begin+K) are the top K moves, though unordered among themselves
+  // if you want them sorted, do a tiny insertion-sort on that prefix:
+  for (ExtMove* p = begin + 1; p < begin + K; ++p) {
+    ExtMove key = *p;
+    ExtMove* q = p;
+    while (q != begin && *(q-1) < key) {
+      *q = *(q-1);
+      --q;
+    }
+    *q = key;
+  }
 }
 
 }  // namespace
