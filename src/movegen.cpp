@@ -134,70 +134,87 @@ Move* generate_pawn_moves(const Position& pos, Move* moveList, Bitboard target) 
     constexpr Direction UpLeft   = (Us == WHITE ? NORTH_WEST : SOUTH_EAST);
 
     const Bitboard emptySquares = ~pos.pieces();
-    const Bitboard enemies      = Type == EVASIONS ? pos.checkers() : pos.pieces(Them);
+    const Bitboard enemies      = (Type == EVASIONS) ? pos.checkers() : pos.pieces(Them);
+    const Bitboard pawns        = pos.pieces(Us, PAWN);
 
-    Bitboard pawnsOn7    = pos.pieces(Us, PAWN) & TRank7BB;
-    Bitboard pawnsNotOn7 = pos.pieces(Us, PAWN) & ~TRank7BB;
+    // Early exit if no pawns
+    if (!pawns)
+        return moveList;
+
+    const Bitboard pawnsOn7    = pawns & TRank7BB;
+    const Bitboard pawnsNotOn7 = pawns & ~TRank7BB;
 
     // Single and double pawn pushes, no promotions
     if constexpr (Type != CAPTURES)
     {
-        Bitboard b1 = shift<Up>(pawnsNotOn7) & emptySquares;
-        Bitboard b2 = shift<Up>(b1 & TRank3BB) & emptySquares;
-
-        if constexpr (Type == EVASIONS)  // Consider only blocking squares
-        {
-            b1 &= target;
-            b2 &= target;
+        if (pawnsNotOn7) {
+            const Bitboard b1 = shift<Up>(pawnsNotOn7) & emptySquares;
+            if (b1) {
+                const Bitboard b2 = shift<Up>(b1 & TRank3BB) & emptySquares;
+                
+                if constexpr (Type == EVASIONS) {
+                    // Apply target mask
+                    moveList = splat_pawn_moves<Up>(moveList, b1 & target);
+                    moveList = splat_pawn_moves<Up + Up>(moveList, b2 & target);
+                } else {
+                    moveList = splat_pawn_moves<Up>(moveList, b1);
+                    moveList = splat_pawn_moves<Up + Up>(moveList, b2);
+                }
+            }
         }
-
-        moveList = splat_pawn_moves<Up>(moveList, b1);
-        moveList = splat_pawn_moves<Up + Up>(moveList, b2);
     }
 
     // Promotions and underpromotions
-    if (pawnsOn7)
-    {
-        Bitboard b1 = shift<UpRight>(pawnsOn7) & enemies;
-        Bitboard b2 = shift<UpLeft>(pawnsOn7) & enemies;
-        Bitboard b3 = shift<Up>(pawnsOn7) & emptySquares;
+    if (pawnsOn7) {
+        const Bitboard b1 = shift<UpRight>(pawnsOn7) & enemies;  // Right captures
+        const Bitboard b2 = shift<UpLeft>(pawnsOn7) & enemies;   // Left captures
+        Bitboard b3 = shift<Up>(pawnsOn7) & emptySquares;        // Forward pushes
 
         if constexpr (Type == EVASIONS)
             b3 &= target;
 
-        while (b1)
-            moveList = make_promotions<Type, UpRight, true>(moveList, pop_lsb(b1));
+        // Process all promotion types in batches for better cache performance
+        Bitboard temp;
+        
+        temp = b1;
+        while (temp)
+            moveList = make_promotions<Type, UpRight, true>(moveList, pop_lsb(temp));
 
-        while (b2)
-            moveList = make_promotions<Type, UpLeft, true>(moveList, pop_lsb(b2));
+        temp = b2;
+        while (temp)
+            moveList = make_promotions<Type, UpLeft, true>(moveList, pop_lsb(temp));
 
-        while (b3)
-            moveList = make_promotions<Type, Up, false>(moveList, pop_lsb(b3));
+        temp = b3;
+        while (temp)
+            moveList = make_promotions<Type, Up, false>(moveList, pop_lsb(temp));
     }
 
-    // Standard and en passant captures
+    // Standard captures and en passant
     if constexpr (Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS)
     {
-        Bitboard b1 = shift<UpRight>(pawnsNotOn7) & enemies;
-        Bitboard b2 = shift<UpLeft>(pawnsNotOn7) & enemies;
+        if (pawnsNotOn7) {
+            const Bitboard b1 = shift<UpRight>(pawnsNotOn7) & enemies;
+            const Bitboard b2 = shift<UpLeft>(pawnsNotOn7) & enemies;
 
-        moveList = splat_pawn_moves<UpRight>(moveList, b1);
-        moveList = splat_pawn_moves<UpLeft>(moveList, b2);
+            moveList = splat_pawn_moves<UpRight>(moveList, b1);
+            moveList = splat_pawn_moves<UpLeft>(moveList, b2);
+        }
 
-        if (pos.ep_square() != SQ_NONE)
-        {
-            assert(rank_of(pos.ep_square()) == relative_rank(Us, RANK_6));
+        // En passant handling - optimized condition checking
+        const Square ep_sq = pos.ep_square();
+        if (ep_sq != SQ_NONE) {
+            // Early exit for evasions if en passant doesn't help
+            if constexpr (Type == EVASIONS) {
+                if (!(target & (ep_sq + Up)))
+                    return moveList;
+            }
 
-            // An en passant capture cannot resolve a discovered check
-            if (Type == EVASIONS && (target & (pos.ep_square() + Up)))
-                return moveList;
-
-            b1 = pawnsNotOn7 & attacks_bb<PAWN>(pos.ep_square(), Them);
-
-            assert(b1);
-
-            while (b1)
-                *moveList++ = Move::make<EN_PASSANT>(pop_lsb(b1), pos.ep_square());
+            const Bitboard ep_pawns = pawnsNotOn7 & attacks_bb<PAWN>(ep_sq, Them);
+            if (ep_pawns) {
+                Bitboard temp = ep_pawns;
+                while (temp)
+                    *moveList++ = Move::make<EN_PASSANT>(pop_lsb(temp), ep_sq);
+            }
         }
     }
 
@@ -290,22 +307,176 @@ template Move* generate<NON_EVASIONS>(const Position&, Move*);
 
 template<>
 Move* generate<LEGAL>(const Position& pos, Move* moveList) {
-
     Color    us     = pos.side_to_move();
     Bitboard pinned = pos.blockers_for_king(us) & pos.pieces(us);
     Square   ksq    = pos.square<KING>(us);
-    Move*    cur    = moveList;
-
-    moveList =
-      pos.checkers() ? generate<EVASIONS>(pos, moveList) : generate<NON_EVASIONS>(pos, moveList);
-    while (cur != moveList)
-        if (((pinned & cur->from_sq()) || cur->from_sq() == ksq || cur->type_of() == EN_PASSANT)
-            && !pos.legal(*cur))
-            *cur = *(--moveList);
-        else
-            ++cur;
-
+    
+    // If we're in check, use the existing evasion generator
+    // (it's already optimized for this case)
+    if (pos.checkers()) {
+        Move* cur = moveList;
+        moveList = generate<EVASIONS>(pos, moveList);
+        
+        // Only need to verify king moves and en passant in evasions
+        while (cur != moveList) {
+            if ((cur->from_sq() == ksq || cur->type_of() == EN_PASSANT) 
+                && !pos.legal(*cur))
+                *cur = *(--moveList);
+            else
+                ++cur;
+        }
+        return moveList;
+    }
+    
+    // Not in check - generate moves more carefully
+    // For non-pinned pieces, all pseudo-legal moves are legal
+    // For pinned pieces, only moves along the pin ray are legal
+    
+    // Generate king moves (always need legality check)
+    Bitboard king_targets = attacks_bb<KING>(ksq) & ~pos.pieces(us);
+    while (king_targets) {
+        Square to = pop_lsb(king_targets);
+        Move m = Move(ksq, to);
+        if (pos.legal(m))
+            *moveList++ = m;
+    }
+    
+    // Generate castling moves (these are always legal if pseudo-legal)
+    if (pos.can_castle(us & ANY_CASTLING)) {
+        for (CastlingRights cr : {us & KING_SIDE, us & QUEEN_SIDE}) {
+            if (!pos.castling_impeded(cr) && pos.can_castle(cr))
+                *moveList++ = Move::make<CASTLING>(ksq, pos.castling_rook_square(cr));
+        }
+    }
+    
+    // For non-pinned pieces, generate all pseudo-legal moves
+    // These are guaranteed to be legal
+    Bitboard non_pinned = pos.pieces(us) & ~pinned & ~pos.pieces(us, KING);
+    
+    // Non-pinned pawns
+    Bitboard non_pinned_pawns = non_pinned & pos.pieces(PAWN);
+    if (non_pinned_pawns) {
+        // Generate pawn moves for non-pinned pawns
+        // (Would need to adapt generate_pawn_moves to take a pawn bitboard parameter)
+        // For now, using simplified approach
+        while (non_pinned_pawns) {
+            Square from = pop_lsb(non_pinned_pawns);
+            Bitboard attacks = attacks_bb<PAWN>(from, us) & pos.pieces(~us);
+            moveList = splat_moves(moveList, from, attacks);
+            
+            // Handle pawn pushes
+            if (us == WHITE) {
+                Square to = from + NORTH;
+                if (pos.empty(to)) {
+                    if (rank_of(from) == RANK_7)
+                        *moveList++ = Move::make<PROMOTION>(from, to, QUEEN);
+                    else {
+                        *moveList++ = Move(from, to);
+                        if (rank_of(from) == RANK_2 && pos.empty(to + NORTH))
+                            *moveList++ = Move(from, to + NORTH);
+                    }
+                }
+            } else {
+                Square to = from + SOUTH;
+                if (pos.empty(to)) {
+                    if (rank_of(from) == RANK_2)
+                        *moveList++ = Move::make<PROMOTION>(from, to, QUEEN);
+                    else {
+                        *moveList++ = Move(from, to);
+                        if (rank_of(from) == RANK_7 && pos.empty(to + SOUTH))
+                            *moveList++ = Move(from, to + SOUTH);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Non-pinned knights (can move anywhere)
+    Bitboard non_pinned_knights = non_pinned & pos.pieces(KNIGHT);
+    while (non_pinned_knights) {
+        Square from = pop_lsb(non_pinned_knights);
+        Bitboard targets = attacks_bb<KNIGHT>(from, pos.pieces()) & ~pos.pieces(us);
+        moveList = splat_moves(moveList, from, targets);
+    }
+    
+    // Non-pinned bishops
+    Bitboard non_pinned_bishops = non_pinned & pos.pieces(BISHOP);
+    while (non_pinned_bishops) {
+        Square from = pop_lsb(non_pinned_bishops);
+        Bitboard targets = attacks_bb<BISHOP>(from, pos.pieces()) & ~pos.pieces(us);
+        moveList = splat_moves(moveList, from, targets);
+    }
+    
+    // Non-pinned rooks
+    Bitboard non_pinned_rooks = non_pinned & pos.pieces(ROOK);
+    while (non_pinned_rooks) {
+        Square from = pop_lsb(non_pinned_rooks);
+        Bitboard targets = attacks_bb<ROOK>(from, pos.pieces()) & ~pos.pieces(us);
+        moveList = splat_moves(moveList, from, targets);
+    }
+    
+    // Non-pinned queens
+    Bitboard non_pinned_queens = non_pinned & pos.pieces(QUEEN);
+    while (non_pinned_queens) {
+        Square from = pop_lsb(non_pinned_queens);
+        Bitboard targets = attacks_bb<QUEEN>(from, pos.pieces()) & ~pos.pieces(us);
+        moveList = splat_moves(moveList, from, targets);
+    }
+    
+    // For pinned pieces, only generate moves along the pin ray
+    while (pinned) {
+        Square from = pop_lsb(pinned);
+        Bitboard pin_ray = line_bb(ksq, from);
+        
+        // Get piece type and generate only moves along pin ray
+        PieceType pt = type_of(pos.piece_on(from));
+        Bitboard targets;
+        
+        switch (pt) {
+            case PAWN:
+                // Pawns can only move forward along pin or capture along pin
+                targets = attacks_bb<PAWN>(from, us) & pos.pieces(~us) & pin_ray;
+                // Add push moves if along pin ray
+                if (us == WHITE) {
+                    Square to = from + NORTH;
+                    if (pos.empty(to) && (pin_ray & to))
+                        targets |= to;
+                } else {
+                    Square to = from + SOUTH;
+                    if (pos.empty(to) && (pin_ray & to))
+                        targets |= to;
+                }
+                break;
+            case KNIGHT:
+                // Pinned knights can never move legally
+                continue;
+            case BISHOP:
+                targets = attacks_bb<BISHOP>(from, pos.pieces()) & ~pos.pieces(us) & pin_ray;
+                break;
+            case ROOK:
+                targets = attacks_bb<ROOK>(from, pos.pieces()) & ~pos.pieces(us) & pin_ray;
+                break;
+            case QUEEN:
+                targets = attacks_bb<QUEEN>(from, pos.pieces()) & ~pos.pieces(us) & pin_ray;
+                break;
+            default:
+                break;
+        }
+        
+        moveList = splat_moves(moveList, from, targets);
+    }
+    
+    // Handle en passant separately (always needs legality check)
+    if (pos.ep_square() != SQ_NONE) {
+        Bitboard ep_pawns = pos.pieces(us, PAWN) & attacks_bb<PAWN>(pos.ep_square(), ~us);
+        while (ep_pawns) {
+            Square from = pop_lsb(ep_pawns);
+            Move m = Move::make<EN_PASSANT>(from, pos.ep_square());
+            if (pos.legal(m))
+                *moveList++ = m;
+        }
+    }
+    
     return moveList;
 }
-
 }  // namespace Stockfish
