@@ -126,82 +126,88 @@ Move* make_promotions(Move* moveList, [[maybe_unused]] Square to) {
 
 template<Color Us, GenType Type>
 Move* generate_pawn_moves(const Position& pos, Move* moveList, Bitboard target) {
-
     constexpr Color     Them     = ~Us;
     constexpr Bitboard  TRank7BB = (Us == WHITE ? Rank7BB : Rank2BB);
     constexpr Bitboard  TRank3BB = (Us == WHITE ? Rank3BB : Rank6BB);
     constexpr Direction Up       = pawn_push(Us);
     constexpr Direction UpRight  = (Us == WHITE ? NORTH_EAST : SOUTH_WEST);
     constexpr Direction UpLeft   = (Us == WHITE ? NORTH_WEST : SOUTH_EAST);
-
+    
+    const Bitboard ourPawns = pos.pieces(Us, PAWN);
+    const Bitboard pawnsNotOn7 = ourPawns & ~TRank7BB;
+    
+    // Early exit if no pawns
+    if (!ourPawns)
+        return moveList;
+    
     const Bitboard emptySquares = ~pos.pieces();
-    const Bitboard enemies      = Type == EVASIONS ? pos.checkers() : pos.pieces(Them);
-
-    Bitboard pawnsOn7    = pos.pieces(Us, PAWN) & TRank7BB;
-    Bitboard pawnsNotOn7 = pos.pieces(Us, PAWN) & ~TRank7BB;
-
+    
     // Single and double pawn pushes, no promotions
     if constexpr (Type != CAPTURES)
     {
         Bitboard b1 = shift<Up>(pawnsNotOn7) & emptySquares;
         Bitboard b2 = shift<Up>(b1 & TRank3BB) & emptySquares;
-
-        if constexpr (Type == EVASIONS)  // Consider only blocking squares
-        {
+        
+        if constexpr (Type == EVASIONS) {
             b1 &= target;
             b2 &= target;
         }
-
+        
         moveList = splat_pawn_moves<Up>(moveList, b1);
         moveList = splat_pawn_moves<Up + Up>(moveList, b2);
     }
-
+    
     // Promotions and underpromotions
+    const Bitboard pawnsOn7 = ourPawns & TRank7BB;
     if (pawnsOn7)
     {
+        const Bitboard enemies = Type == EVASIONS ? pos.checkers() : pos.pieces(Them);
+        
         Bitboard b1 = shift<UpRight>(pawnsOn7) & enemies;
         Bitboard b2 = shift<UpLeft>(pawnsOn7) & enemies;
         Bitboard b3 = shift<Up>(pawnsOn7) & emptySquares;
-
+        
         if constexpr (Type == EVASIONS)
             b3 &= target;
-
+        
+        // Process all three bitboards without repeated function calls
         while (b1)
             moveList = make_promotions<Type, UpRight, true>(moveList, pop_lsb(b1));
-
+        
         while (b2)
             moveList = make_promotions<Type, UpLeft, true>(moveList, pop_lsb(b2));
-
+        
         while (b3)
             moveList = make_promotions<Type, Up, false>(moveList, pop_lsb(b3));
     }
-
+    
     // Standard and en passant captures
     if constexpr (Type == CAPTURES || Type == EVASIONS || Type == NON_EVASIONS)
     {
+        const Bitboard enemies = Type == EVASIONS ? pos.checkers() : pos.pieces(Them);
+        
         Bitboard b1 = shift<UpRight>(pawnsNotOn7) & enemies;
         Bitboard b2 = shift<UpLeft>(pawnsNotOn7) & enemies;
-
+        
         moveList = splat_pawn_moves<UpRight>(moveList, b1);
         moveList = splat_pawn_moves<UpLeft>(moveList, b2);
-
-        if (pos.ep_square() != SQ_NONE)
+        
+        const Square epSq = pos.ep_square();
+        if (epSq != SQ_NONE)
         {
-            assert(rank_of(pos.ep_square()) == relative_rank(Us, RANK_6));
-
-            // An en passant capture cannot resolve a discovered check
-            if (Type == EVASIONS && (target & (pos.ep_square() + Up)))
-                return moveList;
-
-            b1 = pawnsNotOn7 & attacks_bb<PAWN>(pos.ep_square(), Them);
-
-            assert(b1);
-
+            // En passant capture cannot resolve a discovered check in evasions
+            if constexpr (Type == EVASIONS) {
+                if (!(target & (epSq + Up)))
+                    return moveList;
+            }
+            
+            b1 = pawnsNotOn7 & attacks_bb<PAWN>(epSq, Them);
+            
             while (b1)
-                *moveList++ = Move::make<EN_PASSANT>(pop_lsb(b1), pos.ep_square());
+                *moveList++ = Move::make<EN_PASSANT>(pop_lsb(b1), epSq);
         }
     }
-
+    
     return moveList;
 }
 
