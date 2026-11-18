@@ -25,6 +25,10 @@
 #include "misc.h"
 #include "position.h"
 
+#if defined(USE_NEON) && USE_NEON >= 8
+    #include <arm_neon.h>
+#endif
+
 namespace Stockfish {
 
 enum Stages : i8 {
@@ -100,6 +104,74 @@ struct MoveSorter {
 
 // Sort moves in descending order up to and including a given limit.
 // The order of moves smaller than the limit is left unspecified.
+#if defined(USE_NEON) && USE_NEON >= 8
+// Branch-free version of the scalar code below, producing the exact same order.
+// A partition collects the moves to sort, then a stable rank sort places each
+// of them directly at its final index, computed with SIMD comparisons. This
+// avoids the branch mispredictions that dominate insertion sort's cost.
+void partial_insertion_sort(ExtMove* begin, ExtMove* end, int limit) {
+
+    const int size = int(end - begin);
+    if (size <= 1)
+        return;
+
+    alignas(16) int values[MAX_MOVES + 4];
+    ExtMove         sorted[MAX_MOVES];
+
+    // Partition. Moves below the limit get the same order as in the scalar
+    // version, while the first move and the moves at or above the limit are
+    // copied, in their original order, to sorted[] and values[].
+    sorted[0] = begin[0];
+    values[0] = begin[0].value;
+    int count = 1;
+    for (int i = 1; i < size; ++i)
+    {
+        const ExtMove m = begin[i], s = begin[count];
+        const bool    b = m.value >= limit;
+        sorted[count]   = m;
+        values[count]   = m.value;
+        begin[i]        = b ? s : m;
+        count += b;
+    }
+
+    // Pad to whole vectors with a value that never compares greater
+    vst1q_s32(values + count, vdupq_n_s32(std::numeric_limits<int>::min()));
+
+    // Stable rank sort: the final index of move i is the number of moves j
+    // with values[j] > values[i], or values[j] == values[i] and j < i. As
+    // values are integers, the latter is tested as values[j] > values[i] - 1.
+    // Ranks are computed for 4 moves at a time to share the loads.
+    const int32x4_t lanes = {0, 1, 2, 3};
+    for (int i = 0; i < count; i += 4)
+    {
+        int32x4_t vi[4], viLow[4], rank[4];
+        for (int k = 0; k < 4; ++k)
+        {
+            assert(i + k >= count || values[i + k] != std::numeric_limits<int>::min());
+            vi[k]    = vdupq_n_s32(values[i + k]);
+            viLow[k] = vsubq_s32(vi[k], vdupq_n_s32(1));
+            rank[k]  = vdupq_n_s32(0);
+        }
+
+        int32x4_t jMinusI = vsubq_s32(lanes, vdupq_n_s32(i));
+        for (int j = 0; j < count; j += 4)
+        {
+            const int32x4_t vj = vld1q_s32(values + j);
+            for (int k = 0; k < 4; ++k)
+            {
+                // Lanes with j < i + k compare against values[i + k] - 1
+                const uint32x4_t before  = vcltq_s32(jMinusI, vdupq_n_s32(k));
+                const uint32x4_t greater = vcgtq_s32(vj, vbslq_s32(before, viLow[k], vi[k]));
+                rank[k] = vsubq_s32(rank[k], vreinterpretq_s32_u32(greater));
+            }
+            jMinusI = vaddq_s32(jMinusI, vdupq_n_s32(4));
+        }
+
+        for (int k = 0; k < 4 && i + k < count; ++k)
+            begin[vaddvq_s32(rank[k])] = sorted[i + k];
+    }
+}
+#else
 void partial_insertion_sort(ExtMove* begin, ExtMove* end, int limit) {
 
     if (end - begin <= 1)
@@ -134,6 +206,7 @@ void partial_insertion_sort(ExtMove* begin, ExtMove* end, int limit) {
             *q = tmp;
         }
 }
+#endif
 
 }  // namespace
 
